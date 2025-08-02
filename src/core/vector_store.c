@@ -1,0 +1,530 @@
+#include "cvector.h"
+#include "vector_store.h"
+#include "../utils/file_utils.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// Internal database structure
+struct cvector_db {
+    cvector_db_config_t config;
+    FILE* data_file;
+    FILE* index_file;
+    FILE* metadata_file;
+    cvector_id_t next_id;
+    size_t vector_count;
+    bool is_open;
+    
+    // Simple hash table for vector lookup (in-memory for now)
+    cvector_vector_entry_t** hash_table;
+    size_t hash_table_size;
+};
+
+// Hash table entry for fast vector lookup
+typedef struct cvector_vector_entry {
+    cvector_id_t id;
+    uint64_t file_offset;
+    uint32_t dimension;
+    uint64_t timestamp;
+    bool is_deleted;
+    struct cvector_vector_entry* next;  // For collision handling
+} cvector_vector_entry_t;
+
+// File format constants
+#define CVECTOR_MAGIC_NUMBER 0x43564543  // "CVEC"
+#define CVECTOR_FILE_VERSION 1
+#define CVECTOR_BLOCK_SIZE 4096
+#define CVECTOR_HASH_TABLE_SIZE 10007  // Prime number for good distribution
+
+// File header structure
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t dimension;
+    cvector_similarity_t default_similarity;
+    uint64_t vector_count;
+    uint64_t next_id;
+    uint64_t created_timestamp;
+    uint64_t modified_timestamp;
+    uint8_t reserved[32];  // For future use
+} cvector_file_header_t;
+
+// Vector file record structure
+typedef struct {
+    cvector_id_t id;
+    uint32_t dimension;
+    uint64_t timestamp;
+    uint8_t is_deleted;
+    uint8_t reserved[7];
+    // Followed by dimension * sizeof(float) bytes of vector data
+} cvector_vector_record_t;
+
+// Helper functions
+static uint64_t cvector_hash(cvector_id_t id) {
+    return id % CVECTOR_HASH_TABLE_SIZE;
+}
+
+static uint64_t cvector_get_timestamp(void) {
+    return (uint64_t)time(NULL);
+}
+
+static cvector_error_t cvector_init_hash_table(cvector_db_t* db) {
+    db->hash_table_size = CVECTOR_HASH_TABLE_SIZE;
+    db->hash_table = calloc(db->hash_table_size, sizeof(cvector_vector_entry_t*));
+    return db->hash_table ? CVECTOR_SUCCESS : CVECTOR_ERROR_OUT_OF_MEMORY;
+}
+
+static void cvector_free_hash_table(cvector_db_t* db) {
+    if (!db->hash_table) return;
+    
+    for (size_t i = 0; i < db->hash_table_size; i++) {
+        cvector_vector_entry_t* entry = db->hash_table[i];
+        while (entry) {
+            cvector_vector_entry_t* next = entry->next;
+            free(entry);
+            entry = next;
+        }
+    }
+    free(db->hash_table);
+    db->hash_table = NULL;
+}
+
+static cvector_error_t cvector_hash_insert(cvector_db_t* db, cvector_id_t id, 
+                                          uint64_t file_offset, uint32_t dimension) {
+    uint64_t hash_idx = cvector_hash(id);
+    cvector_vector_entry_t* entry = malloc(sizeof(cvector_vector_entry_t));
+    if (!entry) return CVECTOR_ERROR_OUT_OF_MEMORY;
+    
+    entry->id = id;
+    entry->file_offset = file_offset;
+    entry->dimension = dimension;
+    entry->timestamp = cvector_get_timestamp();
+    entry->is_deleted = false;
+    entry->next = db->hash_table[hash_idx];
+    db->hash_table[hash_idx] = entry;
+    
+    return CVECTOR_SUCCESS;
+}
+
+static cvector_vector_entry_t* cvector_hash_find(cvector_db_t* db, cvector_id_t id) {
+    uint64_t hash_idx = cvector_hash(id);
+    cvector_vector_entry_t* entry = db->hash_table[hash_idx];
+    
+    while (entry) {
+        if (entry->id == id && !entry->is_deleted) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+static cvector_error_t cvector_write_header(cvector_db_t* db) {
+    cvector_file_header_t header = {0};
+    header.magic = CVECTOR_MAGIC_NUMBER;
+    header.version = CVECTOR_FILE_VERSION;
+    header.dimension = db->config.dimension;
+    header.default_similarity = db->config.default_similarity;
+    header.vector_count = db->vector_count;
+    header.next_id = db->next_id;
+    header.created_timestamp = cvector_get_timestamp();
+    header.modified_timestamp = header.created_timestamp;
+    
+    fseek(db->data_file, 0, SEEK_SET);
+    size_t written = fwrite(&header, sizeof(header), 1, db->data_file);
+    if (written != 1) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    fflush(db->data_file);
+    return CVECTOR_SUCCESS;
+}
+
+static cvector_error_t cvector_read_header(cvector_db_t* db) {
+    cvector_file_header_t header;
+    
+    fseek(db->data_file, 0, SEEK_SET);
+    size_t read = fread(&header, sizeof(header), 1, db->data_file);
+    if (read != 1) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    if (header.magic != CVECTOR_MAGIC_NUMBER) {
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    
+    if (header.version != CVECTOR_FILE_VERSION) {
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    
+    db->config.dimension = header.dimension;
+    db->config.default_similarity = header.default_similarity;
+    db->vector_count = header.vector_count;
+    db->next_id = header.next_id;
+    
+    return CVECTOR_SUCCESS;
+}
+
+// Public API Implementation
+
+cvector_error_t cvector_db_create(const cvector_db_config_t* config, cvector_db_t** db) {
+    if (!config || !db) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (config->dimension == 0 || config->dimension > CVECTOR_MAX_DIMENSION) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Check if database already exists
+    struct stat st;
+    if (stat(config->data_path, &st) == 0) {
+        return CVECTOR_ERROR_FILE_IO;  // Database already exists
+    }
+    
+    // Create database directory if it doesn't exist
+    char dir_path[CVECTOR_MAX_PATH];
+    strncpy(dir_path, config->data_path, sizeof(dir_path) - 1);
+    dir_path[sizeof(dir_path) - 1] = '\0';
+    
+    char* last_slash = strrchr(dir_path, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        mkdir(dir_path, 0755);
+    }
+    
+    // Allocate database structure
+    *db = calloc(1, sizeof(cvector_db_t));
+    if (!*db) {
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    cvector_db_t* database = *db;
+    memcpy(&database->config, config, sizeof(cvector_db_config_t));
+    database->next_id = 1;
+    database->vector_count = 0;
+    
+    // Initialize hash table
+    cvector_error_t err = cvector_init_hash_table(database);
+    if (err != CVECTOR_SUCCESS) {
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
+    // Create data file
+    database->data_file = fopen(config->data_path, "w+b");
+    if (!database->data_file) {
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Write initial header
+    err = cvector_write_header(database);
+    if (err != CVECTOR_SUCCESS) {
+        fclose(database->data_file);
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
+    database->is_open = true;
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_db_open(const char* db_path, cvector_db_t** db) {
+    if (!db_path || !db) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Check if file exists
+    struct stat st;
+    if (stat(db_path, &st) != 0) {
+        return CVECTOR_ERROR_DB_NOT_FOUND;
+    }
+    
+    // Allocate database structure
+    *db = calloc(1, sizeof(cvector_db_t));
+    if (!*db) {
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    cvector_db_t* database = *db;
+    strncpy(database->config.data_path, db_path, sizeof(database->config.data_path) - 1);
+    database->config.data_path[sizeof(database->config.data_path) - 1] = '\0';
+    
+    // Initialize hash table
+    cvector_error_t err = cvector_init_hash_table(database);
+    if (err != CVECTOR_SUCCESS) {
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
+    // Open data file
+    database->data_file = fopen(db_path, "r+b");
+    if (!database->data_file) {
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Read and validate header
+    err = cvector_read_header(database);
+    if (err != CVECTOR_SUCCESS) {
+        fclose(database->data_file);
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
+    // TODO: Load hash table from file (for now, rebuild on open)
+    // This is a simplified version - in production, we'd persist the hash table
+    
+    database->is_open = true;
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_db_close(cvector_db_t* db) {
+    if (!db || !db->is_open) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Update header with final stats
+    cvector_write_header(db);
+    
+    // Close files
+    if (db->data_file) {
+        fclose(db->data_file);
+        db->data_file = NULL;
+    }
+    
+    // Free hash table
+    cvector_free_hash_table(db);
+    
+    db->is_open = false;
+    free(db);
+    
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_db_drop(const char* db_path) {
+    if (!db_path) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (unlink(db_path) != 0) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
+    if (!db || !db->is_open || !vector || !vector->data) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (vector->dimension != db->config.dimension) {
+        return CVECTOR_ERROR_DIMENSION_MISMATCH;
+    }
+    
+    // Check if vector with this ID already exists
+    if (cvector_hash_find(db, vector->id)) {
+        return CVECTOR_ERROR_INVALID_ARGS;  // Vector already exists
+    }
+    
+    // Seek to end of file
+    fseek(db->data_file, 0, SEEK_END);
+    uint64_t file_offset = ftell(db->data_file);
+    
+    // Create record
+    cvector_vector_record_t record = {0};
+    record.id = vector->id;
+    record.dimension = vector->dimension;
+    record.timestamp = cvector_get_timestamp();
+    record.is_deleted = 0;
+    
+    // Write record header
+    size_t written = fwrite(&record, sizeof(record), 1, db->data_file);
+    if (written != 1) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Write vector data
+    written = fwrite(vector->data, sizeof(float), vector->dimension, db->data_file);
+    if (written != vector->dimension) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Add to hash table
+    cvector_error_t err = cvector_hash_insert(db, vector->id, file_offset, vector->dimension);
+    if (err != CVECTOR_SUCCESS) {
+        return err;
+    }
+    
+    // Update counters
+    db->vector_count++;
+    if (vector->id >= db->next_id) {
+        db->next_id = vector->id + 1;
+    }
+    
+    fflush(db->data_file);
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_get(cvector_db_t* db, cvector_id_t id, cvector_t** vector) {
+    if (!db || !db->is_open || !vector) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Find in hash table
+    cvector_vector_entry_t* entry = cvector_hash_find(db, id);
+    if (!entry) {
+        return CVECTOR_ERROR_VECTOR_NOT_FOUND;
+    }
+    
+    // Seek to record position
+    fseek(db->data_file, entry->file_offset, SEEK_SET);
+    
+    // Read record header
+    cvector_vector_record_t record;
+    size_t read = fread(&record, sizeof(record), 1, db->data_file);
+    if (read != 1) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    if (record.is_deleted) {
+        return CVECTOR_ERROR_VECTOR_NOT_FOUND;
+    }
+    
+    // Allocate vector
+    cvector_t* result = malloc(sizeof(cvector_t));
+    if (!result) {
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    result->data = malloc(record.dimension * sizeof(float));
+    if (!result->data) {
+        free(result);
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Read vector data
+    read = fread(result->data, sizeof(float), record.dimension, db->data_file);
+    if (read != record.dimension) {
+        free(result->data);
+        free(result);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    result->id = record.id;
+    result->dimension = record.dimension;
+    result->timestamp = record.timestamp;
+    
+    *vector = result;
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_delete(cvector_db_t* db, cvector_id_t id) {
+    if (!db || !db->is_open) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Find in hash table
+    cvector_vector_entry_t* entry = cvector_hash_find(db, id);
+    if (!entry) {
+        return CVECTOR_ERROR_VECTOR_NOT_FOUND;
+    }
+    
+    // Mark as deleted in hash table
+    entry->is_deleted = true;
+    
+    // Mark as deleted in file
+    fseek(db->data_file, entry->file_offset + offsetof(cvector_vector_record_t, is_deleted), SEEK_SET);
+    uint8_t deleted_flag = 1;
+    size_t written = fwrite(&deleted_flag, sizeof(deleted_flag), 1, db->data_file);
+    if (written != 1) {
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    db->vector_count--;
+    fflush(db->data_file);
+    
+    return CVECTOR_SUCCESS;
+}
+
+// Utility functions
+
+cvector_error_t cvector_create_vector(cvector_id_t id, uint32_t dimension, 
+                                     const float* data, cvector_t** vector) {
+    if (!data || !vector || dimension == 0) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    cvector_t* v = malloc(sizeof(cvector_t));
+    if (!v) {
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    v->data = malloc(dimension * sizeof(float));
+    if (!v->data) {
+        free(v);
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    v->id = id;
+    v->dimension = dimension;
+    v->timestamp = cvector_get_timestamp();
+    memcpy(v->data, data, dimension * sizeof(float));
+    
+    *vector = v;
+    return CVECTOR_SUCCESS;
+}
+
+void cvector_free_vector(cvector_t* vector) {
+    if (vector) {
+        free(vector->data);
+        free(vector);
+    }
+}
+
+const char* cvector_error_string(cvector_error_t error) {
+    switch (error) {
+        case CVECTOR_SUCCESS: return "Success";
+        case CVECTOR_ERROR_INVALID_ARGS: return "Invalid arguments";
+        case CVECTOR_ERROR_OUT_OF_MEMORY: return "Out of memory";
+        case CVECTOR_ERROR_FILE_IO: return "File I/O error";
+        case CVECTOR_ERROR_DB_NOT_FOUND: return "Database not found";
+        case CVECTOR_ERROR_VECTOR_NOT_FOUND: return "Vector not found";
+        case CVECTOR_ERROR_DIMENSION_MISMATCH: return "Dimension mismatch";
+        case CVECTOR_ERROR_DB_CORRUPT: return "Database corrupt";
+        default: return "Unknown error";
+    }
+}
+
+cvector_error_t cvector_db_stats(cvector_db_t* db, cvector_db_stats_t* stats) {
+    if (!db || !db->is_open || !stats) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    stats->total_vectors = db->vector_count;
+    stats->dimension = db->config.dimension;
+    stats->default_similarity = db->config.default_similarity;
+    strncpy(stats->db_path, db->config.data_path, sizeof(stats->db_path) - 1);
+    stats->db_path[sizeof(stats->db_path) - 1] = '\0';
+    
+    // Calculate total size
+    fseek(db->data_file, 0, SEEK_END);
+    stats->total_size_bytes = ftell(db->data_file);
+    
+    return CVECTOR_SUCCESS;
+}
