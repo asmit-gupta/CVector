@@ -2,6 +2,7 @@
 #define CVECTOR_VECTOR_STORE_H
 
 #include "cvector.h"
+#include "hnsw.h"
 #include <stdio.h>
 
 // Internal structures and functions for vector storage

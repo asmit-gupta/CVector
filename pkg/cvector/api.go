@@ -32,6 +32,19 @@ cvector_error_t insert_vector_wrapper(cvector_db_t* db, uint64_t id, uint32_t di
 
     return cvector_insert(db, &vector);
 }
+
+cvector_error_t search_wrapper(cvector_db_t* db, float* query_vector, uint32_t dimension, 
+                              uint32_t top_k, cvector_similarity_t similarity, float min_similarity,
+                              cvector_result_t** results, size_t* result_count) {
+    cvector_query_t query = {0};
+    query.query_vector = query_vector;
+    query.dimension = dimension;
+    query.top_k = top_k;
+    query.similarity = similarity;
+    query.min_similarity = min_similarity;
+    
+    return cvector_search(db, &query, results, result_count);
+}
 */
 import "C"
 import (
@@ -213,6 +226,68 @@ func (db *DB) Stats() (*Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// Search performs a similarity search on the database
+func (db *DB) Search(query *Query) ([]*Result, error) {
+	if db.db == nil {
+		return nil, ErrInvalidArgs
+	}
+	if query == nil || len(query.QueryVector) == 0 {
+		return nil, ErrInvalidArgs
+	}
+
+	// Allocate C array for query vector
+	dataSize := len(query.QueryVector)
+	cData := (*C.float)(C.malloc(C.size_t(dataSize * 4))) // 4 bytes per float32
+	if cData == nil {
+		return nil, ErrOutOfMemory
+	}
+	defer C.free(unsafe.Pointer(cData))
+
+	// Copy query vector data
+	cDataSlice := (*[1 << 20]C.float)(unsafe.Pointer(cData))[:dataSize:dataSize]
+	for i, v := range query.QueryVector {
+		cDataSlice[i] = C.float(v)
+	}
+
+	// Perform search
+	var cResults *C.cvector_result_t
+	var resultCount C.size_t
+	
+	result := C.search_wrapper(
+		db.db,
+		cData,
+		C.uint32_t(len(query.QueryVector)),
+		C.uint32_t(query.TopK),
+		C.cvector_similarity_t(query.Similarity),
+		C.float(query.MinSimilarity),
+		&cResults,
+		&resultCount,
+	)
+	
+	if result != 0 {
+		return nil, Error(result)
+	}
+
+	if resultCount == 0 || cResults == nil {
+		return []*Result{}, nil
+	}
+	defer C.cvector_free_results(cResults, resultCount)
+
+	// Convert C results to Go results
+	results := make([]*Result, int(resultCount))
+	cResultsSlice := (*[1 << 20]C.cvector_result_t)(unsafe.Pointer(cResults))[:int(resultCount):int(resultCount)]
+	
+	for i, cResult := range cResultsSlice {
+		results[i] = &Result{
+			ID:         uint64(cResult.id),
+			Similarity: float32(cResult.similarity),
+			Vector:     nil, // Vector data not loaded by default
+		}
+	}
+
+	return results, nil
 }
 
 // NewVector creates a new vector with the current timestamp

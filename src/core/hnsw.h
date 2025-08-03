@@ -51,12 +51,15 @@ typedef struct hnsw_search_result {
     uint32_t capacity;                     // Allocated capacity
 } hnsw_search_result_t;
 
+// Priority queue item
+typedef struct {
+    uint32_t node_id;
+    float distance;
+} hnsw_pq_item_t;
+
 // Priority queue for search
 typedef struct hnsw_priority_queue {
-    struct {
-        uint32_t node_id;
-        float distance;
-    } *items;
+    hnsw_pq_item_t* items;
     uint32_t count;
     uint32_t capacity;
     bool is_max_heap;                      // true for max-heap, false for min-heap
@@ -78,7 +81,6 @@ cvector_error_t hnsw_search_with_ef(hnsw_index_t* index, const float* query_vect
                                    uint32_t top_k, uint32_t ef, hnsw_search_result_t** result);
 
 // Utility Functions
-cvector_error_t hnsw_get_stats(hnsw_index_t* index, struct hnsw_stats* stats);
 void hnsw_free_search_result(hnsw_search_result_t* result);
 
 // Priority Queue Operations (internal)
@@ -105,7 +107,7 @@ cvector_error_t hnsw_set_config(hnsw_index_t* index, const hnsw_config_t* config
 cvector_error_t hnsw_get_config(hnsw_index_t* index, hnsw_config_t* config);
 
 // Statistics
-typedef struct hnsw_stats {
+typedef struct {
     uint32_t node_count;                  // Total nodes in index
     uint32_t max_level;                   // Maximum level
     uint64_t search_count;                // Number of searches
@@ -113,6 +115,9 @@ typedef struct hnsw_stats {
     float avg_connections_per_node;       // Average connections
     uint32_t entry_point_level;           // Entry point level
 } hnsw_stats_t;
+
+// Statistics Functions
+cvector_error_t hnsw_get_stats(hnsw_index_t* index, hnsw_stats_t* stats);
 
 // Persistence (future)
 cvector_error_t hnsw_save_index(hnsw_index_t* index, const char* filepath);

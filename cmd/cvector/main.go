@@ -40,6 +40,8 @@ func main() {
 		handleGenerate(args)
 	case "drop":
 		handleDrop(args)
+	case "search":
+		handleSearch(args)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		printUsage()
@@ -72,6 +74,9 @@ func printUsage() {
 	fmt.Println("  cvector drop --path=PATH")
 	fmt.Println("    Drop (delete) a database")
 	fmt.Println("")
+	fmt.Println("  cvector search [--path=PATH] --vector=\"1.0,2.0,3.0,...\" [--top-k=K] [--similarity=TYPE]")
+	fmt.Println("    Search for similar vectors")
+	fmt.Println("")
 	fmt.Println("Options:")
 	fmt.Printf("  --path        Database file path (default: %s)\n", defaultDBPath)
 	fmt.Printf("  --dimension   Vector dimension (default: %d)\n", defaultDimension)
@@ -79,6 +84,8 @@ func printUsage() {
 	fmt.Println("  --id          Vector ID")
 	fmt.Println("  --vector      Vector data as comma-separated floats")
 	fmt.Println("  --count       Number of vectors to generate")
+	fmt.Println("  --top-k       Number of results to return (default: 10)")
+	fmt.Println("  --similarity  Similarity type: cosine, dot, euclidean (default: cosine)")
 }
 
 func handleCreate(args []string) {
@@ -322,6 +329,83 @@ func handleDrop(args []string) {
 	}
 
 	fmt.Printf("Database dropped successfully!\n")
+}
+
+func handleSearch(args []string) {
+	fs := flag.NewFlagSet("search", flag.ExitOnError)
+	path := fs.String("path", defaultDBPath, "Database path")
+	vectorStr := fs.String("vector", "", "Query vector data (comma-separated floats)")
+	topK := fs.Int("top-k", 10, "Number of results to return")
+	similarityStr := fs.String("similarity", "cosine", "Similarity type (cosine, dot, euclidean)")
+
+	fs.Parse(args)
+
+	if *vectorStr == "" {
+		fmt.Println("Error: --vector is required")
+		os.Exit(1)
+	}
+
+	if *topK <= 0 {
+		fmt.Println("Error: --top-k must be greater than 0")
+		os.Exit(1)
+	}
+
+	// Parse vector data
+	queryVector, err := parseVectorString(*vectorStr)
+	if err != nil {
+		fmt.Printf("Error parsing query vector: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Parse similarity type
+	var similarity cvector.SimilarityType
+	switch strings.ToLower(*similarityStr) {
+	case "cosine":
+		similarity = cvector.SimilarityCosine
+	case "dot", "dotproduct":
+		similarity = cvector.SimilarityDotProduct
+	case "euclidean", "l2":
+		similarity = cvector.SimilarityEuclidean
+	default:
+		fmt.Printf("Error: unknown similarity type '%s'. Use cosine, dot, or euclidean\n", *similarityStr)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Opening database: %s\n", *path)
+	db, err := cvector.OpenDB(*path)
+	if err != nil {
+		fmt.Printf("Error opening database: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	query := &cvector.Query{
+		QueryVector:   queryVector,
+		TopK:          uint32(*topK),
+		Similarity:    similarity,
+		MinSimilarity: 0.0, // No minimum similarity filter
+	}
+
+	fmt.Printf("Searching for similar vectors (top-%d, similarity: %s, dimension: %d)\n", 
+		*topK, *similarityStr, len(queryVector))
+
+	results, err := db.Search(query)
+	if err != nil {
+		fmt.Printf("Error searching: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No similar vectors found.")
+		return
+	}
+
+	fmt.Printf("\nSearch Results (%d found):\n", len(results))
+	fmt.Println("Rank | Vector ID | Similarity Score")
+	fmt.Println("-----|-----------|----------------")
+	for i, result := range results {
+		fmt.Printf("%-4d | %-9d | %.6f\n", i+1, result.ID, result.Similarity)
+	}
 }
 
 // Helper functions

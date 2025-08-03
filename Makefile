@@ -55,9 +55,9 @@ clean:
 test: test-c test-go
 
 test-c: c-lib
-	@echo "Running C tests..."
-	$(CC) $(CFLAGS) -I./src -L./build -lcvector -lm tests/c/test_vector_store.c -o $(BUILD_DIR)/test_c
-	./$(BUILD_DIR)/test_c
+	@echo "Running comprehensive tests..."
+	$(CC) $(CFLAGS) -I./src -L./build -lcvector -lm tests/c/comprehensive_test.c -o $(BUILD_DIR)/comprehensive_test
+	./$(BUILD_DIR)/comprehensive_test
 
 test-go: go-build
 	@echo "Running Go tests..."

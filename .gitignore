@@ -1,0 +1,40 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Debug symbols
+*.dSYM/
+
+# Test files and databases
+*.cvdb
+data/*.cvdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test executables
+*_test
+*test
+debug_*
+simple_*
+
+# Benchmark results
+benchmark_results_*.txt
+
+# Go binaries
+cvector
+cvector-bench
+
+# Temporary files
+*.tmp
+*.temp

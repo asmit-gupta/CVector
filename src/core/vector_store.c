@@ -1,5 +1,7 @@
 #include "cvector.h"
 #include "vector_store.h"
+#include "hnsw.h"
+#include "similarity.h"
 #include "../utils/file_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,9 @@ struct cvector_db {
     // Simple hash table for vector lookup (in-memory for now)
     cvector_vector_entry_t** hash_table;
     size_t hash_table_size;
+    
+    // HNSW index for similarity search
+    hnsw_index_t* hnsw_index;
 };
 
 // File format constants
@@ -205,9 +210,19 @@ cvector_error_t cvector_db_create(const cvector_db_config_t* config, cvector_db_
         return err;
     }
     
+    // Initialize HNSW index
+    err = hnsw_create_index(config->dimension, config->default_similarity, &database->hnsw_index);
+    if (err != CVECTOR_SUCCESS) {
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
     // Create data file
     database->data_file = fopen(config->data_path, "w+b");
     if (!database->data_file) {
+        hnsw_destroy_index(database->hnsw_index);
         cvector_free_hash_table(database);
         free(database);
         *db = NULL;
@@ -218,6 +233,7 @@ cvector_error_t cvector_db_create(const cvector_db_config_t* config, cvector_db_
     err = cvector_write_header(database);
     if (err != CVECTOR_SUCCESS) {
         fclose(database->data_file);
+        hnsw_destroy_index(database->hnsw_index);
         cvector_free_hash_table(database);
         free(database);
         *db = NULL;
@@ -276,8 +292,43 @@ cvector_error_t cvector_db_open(const char* db_path, cvector_db_t** db) {
         return err;
     }
     
-    // TODO: Load hash table from file (for now, rebuild on open)
-    // This is a simplified version - in production, we'd persist the hash table
+    // Initialize HNSW index
+    err = hnsw_create_index(database->config.dimension, database->config.default_similarity, &database->hnsw_index);
+    if (err != CVECTOR_SUCCESS) {
+        fclose(database->data_file);
+        cvector_free_hash_table(database);
+        free(database);
+        *db = NULL;
+        return err;
+    }
+    
+    // Rebuild hash table and HNSW index from existing vectors in the file
+    fseek(database->data_file, sizeof(cvector_file_header_t), SEEK_SET);
+    
+    while (true) {
+        uint64_t record_start = ftell(database->data_file);
+        cvector_vector_record_t record;
+        size_t read = fread(&record, sizeof(record), 1, database->data_file);
+        if (read != 1) break; // End of file or error
+        
+        if (!record.is_deleted) {
+            // Read vector data
+            float* vector_data = malloc(record.dimension * sizeof(float));
+            if (vector_data) {
+                read = fread(vector_data, sizeof(float), record.dimension, database->data_file);
+                if (read == record.dimension) {
+                    // Add to hash table
+                    cvector_hash_insert(database, record.id, record_start, record.dimension);
+                    
+                    // HNSW indexing temporarily disabled for stability
+                }
+                free(vector_data);
+            }
+        } else {
+            // Skip deleted vector data
+            fseek(database->data_file, record.dimension * sizeof(float), SEEK_CUR);
+        }
+    }
     
     database->is_open = true;
     return CVECTOR_SUCCESS;
@@ -299,6 +350,12 @@ cvector_error_t cvector_db_close(cvector_db_t* db) {
     
     // Free hash table
     cvector_free_hash_table(db);
+    
+    // Destroy HNSW index
+    if (db->hnsw_index) {
+        hnsw_destroy_index(db->hnsw_index);
+        db->hnsw_index = NULL;
+    }
     
     db->is_open = false;
     free(db);
@@ -360,6 +417,8 @@ cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
     if (err != CVECTOR_SUCCESS) {
         return err;
     }
+    
+    // HNSW indexing temporarily disabled for stability
     
     // Update counters
     db->vector_count++;
@@ -438,6 +497,8 @@ cvector_error_t cvector_delete(cvector_db_t* db, cvector_id_t id) {
     // Mark as deleted in hash table
     entry->is_deleted = true;
     
+    // HNSW indexing temporarily disabled for stability
+    
     // Mark as deleted in file
     fseek(db->data_file, entry->file_offset + offsetof(cvector_vector_record_t, is_deleted), SEEK_SET);
     uint8_t deleted_flag = 1;
@@ -449,6 +510,110 @@ cvector_error_t cvector_delete(cvector_db_t* db, cvector_id_t id) {
     db->vector_count--;
     fflush(db->data_file);
     
+    return CVECTOR_SUCCESS;
+}
+
+cvector_error_t cvector_search(cvector_db_t* db, const cvector_query_t* query, 
+                              cvector_result_t** results, size_t* result_count) {
+    if (!db || !db->is_open || !query || !results || !result_count) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (!query->query_vector || query->dimension != db->config.dimension) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    *results = NULL;
+    *result_count = 0;
+    
+    // If empty index, return empty results
+    if (db->vector_count == 0) {
+        return CVECTOR_SUCCESS;
+    }
+    
+    // Use brute force search - HNSW temporarily disabled for stability
+    size_t max_results = (query->top_k < db->vector_count) ? query->top_k : db->vector_count;
+    cvector_result_t* temp_results = malloc(max_results * sizeof(cvector_result_t));
+    if (!temp_results) {
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    size_t valid_results = 0;
+    
+    // Iterate through all vectors and calculate similarities
+    for (size_t i = 0; i < db->hash_table_size && valid_results < max_results; i++) {
+        cvector_vector_entry_t* entry = db->hash_table[i];
+        
+        while (entry && valid_results < max_results) {
+            if (!entry->is_deleted) {
+                // Get the vector data
+                cvector_t* vector = NULL;
+                cvector_error_t get_err = cvector_get(db, entry->id, &vector);
+                if (get_err == CVECTOR_SUCCESS && vector) {
+                    // Calculate similarity
+                    float similarity = 0.0f;
+                    switch (query->similarity) {
+                        case CVECTOR_SIMILARITY_COSINE:
+                            similarity = cvector_cosine_similarity(query->query_vector, vector->data, query->dimension);
+                            break;
+                        case CVECTOR_SIMILARITY_DOT_PRODUCT:
+                            similarity = cvector_dot_product(query->query_vector, vector->data, query->dimension);
+                            break;
+                        case CVECTOR_SIMILARITY_EUCLIDEAN:
+                            similarity = -cvector_euclidean_distance(query->query_vector, vector->data, query->dimension);
+                            break;
+                        default:
+                            similarity = 0.0f;
+                    }
+                    
+                    // Check minimum similarity threshold
+                    if (query->min_similarity == 0.0f || similarity >= query->min_similarity) {
+                        temp_results[valid_results].id = entry->id;
+                        temp_results[valid_results].similarity = similarity;
+                        temp_results[valid_results].vector = NULL;
+                        valid_results++;
+                    }
+                    
+                    cvector_free_vector(vector);
+                }
+            }
+            entry = entry->next;
+        }
+    }
+    
+    // Sort results by similarity (descending) - only if we have results
+    if (valid_results > 1) {
+        for (size_t i = 0; i < valid_results - 1; i++) {
+            for (size_t j = 0; j < valid_results - i - 1; j++) {
+                if (temp_results[j].similarity < temp_results[j + 1].similarity) {
+                    cvector_result_t temp = temp_results[j];
+                    temp_results[j] = temp_results[j + 1];
+                    temp_results[j + 1] = temp;
+                }
+            }
+        }
+    }
+    
+    // Limit to top_k results
+    if (valid_results > query->top_k) {
+        valid_results = query->top_k;
+    }
+    
+    if (valid_results == 0) {
+        free(temp_results);
+        return CVECTOR_SUCCESS;
+    }
+    
+    // Resize results array to actual size
+    if (valid_results < max_results) {
+        cvector_result_t* final_results = realloc(temp_results, valid_results * sizeof(cvector_result_t));
+        if (final_results) {
+            temp_results = final_results;
+        }
+    }
+    
+    *results = temp_results;
+    *result_count = valid_results;
     return CVECTOR_SUCCESS;
 }
 
@@ -484,6 +649,17 @@ void cvector_free_vector(cvector_t* vector) {
     if (vector) {
         free(vector->data);
         free(vector);
+    }
+}
+
+void cvector_free_results(cvector_result_t* results, size_t count) {
+    if (results) {
+        for (size_t i = 0; i < count; i++) {
+            if (results[i].vector) {
+                cvector_free_vector(results[i].vector);
+            }
+        }
+        free(results);
     }
 }
 
