@@ -1,122 +1,66 @@
 package cvector
 
 /*
-#cgo CFLAGS: -I../../src
-#cgo LDFLAGS: -L../../build -lcvector
+#cgo CFLAGS: -I../../src -std=c11
+#cgo LDFLAGS: -L../../build -lcvector -lm
+
 #include "core/cvector.h"
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+// Wrapper functions to avoid CGO struct issues
+cvector_error_t create_db_wrapper(const char* name, const char* path, uint32_t dimension, cvector_db_t** db) {
+    cvector_db_config_t config = {0};
+
+    strncpy(config.name, name, CVECTOR_MAX_DB_NAME - 1);
+    strncpy(config.data_path, path, CVECTOR_MAX_PATH - 1);
+    config.dimension = dimension;
+    config.default_similarity = CVECTOR_SIMILARITY_COSINE;
+    config.memory_mapped = false;
+    config.max_vectors = 1000000;
+
+    return cvector_db_create(&config, db);
+}
+
+cvector_error_t insert_vector_wrapper(cvector_db_t* db, uint64_t id, uint32_t dimension, float* data) {
+    cvector_t vector = {0};
+    vector.id = id;
+    vector.dimension = dimension;
+    vector.data = data;
+    vector.timestamp = (uint64_t)time(NULL);
+
+    return cvector_insert(db, &vector);
+}
 */
 import "C"
 import (
-	"fmt"
 	"runtime"
 	"time"
 	"unsafe"
 )
-
-// Error wraps CVector error codes
-type Error int
-
-const (
-	Success              Error = C.CVECTOR_SUCCESS
-	ErrInvalidArgs       Error = C.CVECTOR_ERROR_INVALID_ARGS
-	ErrOutOfMemory       Error = C.CVECTOR_ERROR_OUT_OF_MEMORY
-	ErrFileIO            Error = C.CVECTOR_ERROR_FILE_IO
-	ErrDBNotFound        Error = C.CVECTOR_ERROR_DB_NOT_FOUND
-	ErrVectorNotFound    Error = C.CVECTOR_ERROR_VECTOR_NOT_FOUND
-	ErrDimensionMismatch Error = C.CVECTOR_ERROR_DIMENSION_MISMATCH
-	ErrDBCorrupt         Error = C.CVECTOR_ERROR_DB_CORRUPT
-)
-
-func (e Error) Error() string {
-	return C.GoString(C.cvector_error_string(C.cvector_error_t(e)))
-}
-
-// SimilarityType represents different similarity metrics
-type SimilarityType int
-
-const (
-	SimilarityCosine      SimilarityType = C.CVECTOR_SIMILARITY_COSINE
-	SimilarityDotProduct  SimilarityType = C.CVECTOR_SIMILARITY_DOT_PRODUCT
-	SimilarityEuclidean   SimilarityType = C.CVECTOR_SIMILARITY_EUCLIDEAN
-)
-
-// DBConfig holds database configuration
-type DBConfig struct {
-	Name              string
-	DataPath          string
-	Dimension         uint32
-	DefaultSimilarity SimilarityType
-	MemoryMapped      bool
-	MaxVectors        int
-}
 
 // DB represents a CVector database
 type DB struct {
 	db *C.cvector_db_t
 }
 
-// Vector represents a vector with metadata
-type Vector struct {
-	ID        uint64
-	Dimension uint32
-	Data      []float32
-	Timestamp time.Time
-}
-
-// Result represents a search result
-type Result struct {
-	ID         uint64
-	Similarity float32
-	Vector     *Vector // Optional: full vector data
-}
-
-// Query represents a search query
-type Query struct {
-	QueryVector   []float32
-	TopK          uint32
-	Similarity    SimilarityType
-	MinSimilarity float32
-}
-
-// Stats holds database statistics
-type Stats struct {
-	TotalVectors      int
-	TotalSizeBytes    int
-	Dimension         uint32
-	DefaultSimilarity SimilarityType
-	DBPath            string
-}
-
 // CreateDB creates a new vector database
 func CreateDB(config *DBConfig) (*DB, error) {
 	if config == nil {
-		return nil, Error(ErrInvalidArgs)
+		return nil, ErrInvalidArgs
 	}
 
-	// Convert Go config to C config
-	cConfig := C.cvector_db_config_t{}
+	cName := C.CString(config.Name)
+	defer C.free(unsafe.Pointer(cName))
 	
-	nameBytes := []byte(config.Name)
-	if len(nameBytes) >= C.CVECTOR_MAX_DB_NAME {
-		return nil, Error(ErrInvalidArgs)
-	}
-	copy((*[C.CVECTOR_MAX_DB_NAME]C.char)(unsafe.Pointer(&cConfig.name[0]))[:], nameBytes)
-	
-	pathBytes := []byte(config.DataPath)
-	if len(pathBytes) >= C.CVECTOR_MAX_PATH {
-		return nil, Error(ErrInvalidArgs)
-	}
-	copy((*[C.CVECTOR_MAX_PATH]C.char)(unsafe.Pointer(&cConfig.data_path[0]))[:], pathBytes)
-	
-	cConfig.dimension = C.uint32_t(config.Dimension)
-	cConfig.default_similarity = C.cvector_similarity_t(config.DefaultSimilarity)
-	cConfig.memory_mapped = C.bool(config.MemoryMapped)
-	cConfig.max_vectors = C.size_t(config.MaxVectors)
+	cPath := C.CString(config.DataPath)
+	defer C.free(unsafe.Pointer(cPath))
 
 	var cDB *C.cvector_db_t
-	result := C.cvector_db_create(&cConfig, &cDB)
-	if result != C.CVECTOR_SUCCESS {
+	result := C.create_db_wrapper(cName, cPath, C.uint32_t(config.Dimension), &cDB)
+	
+	if result != 0 {
 		return nil, Error(result)
 	}
 
@@ -133,7 +77,7 @@ func OpenDB(dbPath string) (*DB, error) {
 
 	var cDB *C.cvector_db_t
 	result := C.cvector_db_open(cPath, &cDB)
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return nil, Error(result)
 	}
 
@@ -153,7 +97,7 @@ func (db *DB) Close() error {
 	db.db = nil
 	runtime.SetFinalizer(db, nil)
 	
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return Error(result)
 	}
 	return nil
@@ -165,7 +109,7 @@ func DropDB(dbPath string) error {
 	defer C.free(unsafe.Pointer(cPath))
 
 	result := C.cvector_db_drop(cPath)
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return Error(result)
 	}
 	return nil
@@ -174,35 +118,29 @@ func DropDB(dbPath string) error {
 // Insert adds a vector to the database
 func (db *DB) Insert(vector *Vector) error {
 	if db.db == nil {
-		return Error(ErrInvalidArgs)
+		return ErrInvalidArgs
 	}
 	if vector == nil || len(vector.Data) == 0 {
-		return Error(ErrInvalidArgs)
-	}
-
-	// Convert Go vector to C vector
-	cVector := C.cvector_t{
-		id:        C.cvector_id_t(vector.ID),
-		dimension: C.uint32_t(vector.Dimension),
-		timestamp: C.uint64_t(vector.Timestamp.Unix()),
+		return ErrInvalidArgs
 	}
 
 	// Allocate C array for vector data
-	dataSize := len(vector.Data) * int(unsafe.Sizeof(float32(0)))
-	cVector.data = (*C.float)(C.malloc(C.size_t(dataSize)))
-	if cVector.data == nil {
-		return Error(ErrOutOfMemory)
+	dataSize := len(vector.Data)
+	cData := (*C.float)(C.malloc(C.size_t(dataSize * 4))) // 4 bytes per float32
+	if cData == nil {
+		return ErrOutOfMemory
 	}
-	defer C.free(unsafe.Pointer(cVector.data))
+	defer C.free(unsafe.Pointer(cData))
 
-	// Copy data
-	cDataSlice := (*[1 << 20]C.float)(unsafe.Pointer(cVector.data))[:len(vector.Data):len(vector.Data)]
+	// Copy data using slice header manipulation  
+	cDataSlice := (*[1 << 20]C.float)(unsafe.Pointer(cData))[:dataSize:dataSize]
 	for i, v := range vector.Data {
 		cDataSlice[i] = C.float(v)
 	}
 
-	result := C.cvector_insert(db.db, &cVector)
-	if result != C.CVECTOR_SUCCESS {
+	// Use wrapper function instead of creating struct in Go
+	result := C.insert_vector_wrapper(db.db, C.uint64_t(vector.ID), C.uint32_t(vector.Dimension), cData)
+	if result != 0 {
 		return Error(result)
 	}
 	return nil
@@ -211,12 +149,12 @@ func (db *DB) Insert(vector *Vector) error {
 // Get retrieves a vector by ID
 func (db *DB) Get(id uint64) (*Vector, error) {
 	if db.db == nil {
-		return nil, Error(ErrInvalidArgs)
+		return nil, ErrInvalidArgs
 	}
 
 	var cVector *C.cvector_t
 	result := C.cvector_get(db.db, C.cvector_id_t(id), &cVector)
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return nil, Error(result)
 	}
 	defer C.cvector_free_vector(cVector)
@@ -228,12 +166,14 @@ func (db *DB) Get(id uint64) (*Vector, error) {
 		Timestamp: time.Unix(int64(cVector.timestamp), 0),
 	}
 
-	// Copy vector data
+	// Copy vector data safely
 	dataSize := int(cVector.dimension)
 	vector.Data = make([]float32, dataSize)
-	cDataSlice := (*[1 << 20]C.float)(unsafe.Pointer(cVector.data))[:dataSize:dataSize]
-	for i, v := range cDataSlice {
-		vector.Data[i] = float32(v)
+	if cVector.data != nil {
+		cDataSlice := (*[1 << 20]C.float)(unsafe.Pointer(cVector.data))[:dataSize:dataSize]
+		for i, v := range cDataSlice {
+			vector.Data[i] = float32(v)
+		}
 	}
 
 	return vector, nil
@@ -242,11 +182,11 @@ func (db *DB) Get(id uint64) (*Vector, error) {
 // Delete removes a vector by ID
 func (db *DB) Delete(id uint64) error {
 	if db.db == nil {
-		return Error(ErrInvalidArgs)
+		return ErrInvalidArgs
 	}
 
 	result := C.cvector_delete(db.db, C.cvector_id_t(id))
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return Error(result)
 	}
 	return nil
@@ -255,12 +195,12 @@ func (db *DB) Delete(id uint64) error {
 // Stats returns database statistics
 func (db *DB) Stats() (*Stats, error) {
 	if db.db == nil {
-		return nil, Error(ErrInvalidArgs)
+		return nil, ErrInvalidArgs
 	}
 
 	var cStats C.cvector_db_stats_t
 	result := C.cvector_db_stats(db.db, &cStats)
-	if result != C.CVECTOR_SUCCESS {
+	if result != 0 {
 		return nil, Error(result)
 	}
 

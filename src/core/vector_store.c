@@ -23,16 +23,6 @@ struct cvector_db {
     size_t hash_table_size;
 };
 
-// Hash table entry for fast vector lookup
-typedef struct cvector_vector_entry {
-    cvector_id_t id;
-    uint64_t file_offset;
-    uint32_t dimension;
-    uint64_t timestamp;
-    bool is_deleted;
-    struct cvector_vector_entry* next;  // For collision handling
-} cvector_vector_entry_t;
-
 // File format constants
 #define CVECTOR_MAGIC_NUMBER 0x43564543  // "CVEC"
 #define CVECTOR_FILE_VERSION 1
