@@ -1,5 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -O2 -fPIC -I./src
+CFLAGS = -Wall -Wextra -std=c11 -O2 -fPIC -I./src -pthread
+LDFLAGS = -lm -lpthread
 GO = go
 BUILD_DIR = build
 SRC_DIR = src
@@ -38,7 +39,7 @@ go-build: c-lib
 	@echo "Building Go binary..."
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="-I./src -std=c11" \
-	CGO_LDFLAGS="-L./build -lcvector -lm" \
+	CGO_LDFLAGS="-L./build -lcvector -lm -lpthread" \
 	$(GO) build -o $(GO_BINARY) ./cmd/cvector
 	@echo "Go binary built successfully"
 
@@ -56,12 +57,12 @@ test: test-c test-go
 
 test-c: c-lib
 	@echo "Running comprehensive tests..."
-	$(CC) $(CFLAGS) -I./src -L./build -lcvector -lm tests/c/comprehensive_test.c -o $(BUILD_DIR)/comprehensive_test
+	$(CC) $(CFLAGS) -I./src -L./build tests/c/comprehensive_test.c -lcvector $(LDFLAGS) -o $(BUILD_DIR)/comprehensive_test
 	./$(BUILD_DIR)/comprehensive_test
 
 test-go: go-build
 	@echo "Running Go tests..."
-	cd tests/go && CGO_ENABLED=1 CGO_CFLAGS="-I../../src" CGO_LDFLAGS="-L../../build -lcvector -lm" $(GO) test -v
+	cd tests/go && CGO_ENABLED=1 CGO_CFLAGS="-I../../src" CGO_LDFLAGS="-L../../build -lcvector -lm -lpthread" $(GO) test -v
 
 # Install dependencies
 deps:

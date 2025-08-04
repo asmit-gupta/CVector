@@ -5,16 +5,73 @@
 #include <math.h>
 #include <float.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+// Production-grade logging levels
+typedef enum {
+    HNSW_LOG_ERROR = 0,
+    HNSW_LOG_WARN = 1,
+    HNSW_LOG_INFO = 2,
+    HNSW_LOG_DEBUG = 3
+} hnsw_log_level_t;
+
+static hnsw_log_level_t g_hnsw_log_level = HNSW_LOG_WARN;
+
+// Production-grade logging function
+static void hnsw_log(hnsw_log_level_t level, const char* format, ...) {
+    if (level > g_hnsw_log_level) return;
+    
+    const char* level_str[] = {"ERROR", "WARN", "INFO", "DEBUG"};
+    fprintf(stderr, "[HNSW %s] ", level_str[level]);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    
+    fprintf(stderr, "\n");
+}
+
+// Input validation helper
+static cvector_error_t hnsw_validate_index(hnsw_index_t* index) {
+    if (!index) {
+        hnsw_log(HNSW_LOG_ERROR, "Index is NULL");
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    if (!index->nodes) {
+        hnsw_log(HNSW_LOG_ERROR, "Index nodes array is NULL");
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    if (index->dimension == 0) {
+        hnsw_log(HNSW_LOG_ERROR, "Index dimension is 0");
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    if (index->node_count > index->node_capacity) {
+        hnsw_log(HNSW_LOG_ERROR, "Node count (%u) exceeds capacity (%u)", 
+                index->node_count, index->node_capacity);
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    return CVECTOR_SUCCESS;
+}
+
+// Memory safety helper
+static bool hnsw_is_valid_node_id(hnsw_index_t* index, uint32_t node_id) {
+    return index && node_id < index->node_count && index->nodes[node_id] != NULL;
+}
 
 // Internal helper functions
 static uint32_t hnsw_random_level(float ml);
 static cvector_error_t hnsw_resize_index(hnsw_index_t* index);
 static cvector_error_t hnsw_connect_layers(hnsw_index_t* index, uint32_t node_id, uint32_t level);
+static cvector_error_t hnsw_connect_layers_safe(hnsw_index_t* index, uint32_t node_id, uint32_t max_level);
 static cvector_error_t hnsw_search_layer(hnsw_index_t* index, const float* query_vector,
                                         hnsw_priority_queue_t* entry_points, uint32_t num_closest,
                                         uint32_t level);
 static void hnsw_heap_up(hnsw_priority_queue_t* pq, uint32_t idx);
 static void hnsw_heap_down(hnsw_priority_queue_t* pq, uint32_t idx);
+static cvector_error_t hnsw_select_neighbors_simple(hnsw_index_t* index, uint32_t node_id, 
+                                                   hnsw_priority_queue_t* candidates, uint32_t M, uint32_t level);
 
 // Random level generation using ml parameter
 static uint32_t hnsw_random_level(float ml) {
@@ -266,9 +323,12 @@ static cvector_error_t hnsw_search_layer(hnsw_index_t* index, const float* query
         return CVECTOR_ERROR_OUT_OF_MEMORY;
     }
     
-    // Mark entry points as visited
+    // Mark entry points as visited (with bounds checking)
     for (uint32_t i = 0; i < entry_points->count; i++) {
-        visited[entry_points->items[i].node_id] = true;
+        uint32_t node_id = entry_points->items[i].node_id;
+        if (node_id < index->node_count) {
+            visited[node_id] = true;
+        }
     }
     
     while (!hnsw_pq_is_empty(candidates)) {
@@ -294,7 +354,7 @@ static cvector_error_t hnsw_search_layer(hnsw_index_t* index, const float* query
                 continue;
             }
             
-            if (!visited[neighbor_id]) {
+            if (neighbor_id < index->node_count && !visited[neighbor_id]) {
                 visited[neighbor_id] = true;
                 
                 float neighbor_dist = hnsw_calculate_similarity(query_vector,
@@ -333,14 +393,27 @@ static cvector_error_t hnsw_search_layer(hnsw_index_t* index, const float* query
 }
 
 cvector_error_t hnsw_add_vector(hnsw_index_t* index, cvector_id_t id, const float* vector) {
-    if (!index || !vector) {
+    // Input validation with detailed logging
+    cvector_error_t err = hnsw_validate_index(index);
+    if (err != CVECTOR_SUCCESS) return err;
+    
+    if (!vector) {
+        hnsw_log(HNSW_LOG_ERROR, "Vector data is NULL");
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
+    hnsw_log(HNSW_LOG_DEBUG, "Adding vector ID %llu to HNSW index (current size: %u)", 
+             (unsigned long long)id, index->node_count);
+    
     // Resize if needed
     if (index->node_count >= index->node_capacity) {
-        cvector_error_t err = hnsw_resize_index(index);
-        if (err != CVECTOR_SUCCESS) return err;
+        hnsw_log(HNSW_LOG_DEBUG, "Resizing index from %u to %u capacity", 
+                index->node_capacity, index->node_capacity * 2);
+        err = hnsw_resize_index(index);
+        if (err != CVECTOR_SUCCESS) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to resize index: %d", err);
+            return err;
+        }
     }
     
     // Create new node
@@ -388,37 +461,18 @@ cvector_error_t hnsw_add_vector(hnsw_index_t* index, cvector_id_t id, const floa
         return CVECTOR_SUCCESS;
     }
     
-    // Connect to the graph (simplified for debugging)
-    if (index->node_count <= 2) {
-        // For the first few nodes, create simple connections to avoid complex search
-        if (index->entry_point != UINT32_MAX && index->entry_point != node_id) {
-            // Connect to entry point at level 0
-            if (node->level >= 0) {
-                node->connections[0][0] = index->entry_point;
-                node->connection_count[0] = 1;
-                
-                // Add reverse connection if possible
-                hnsw_node_t* entry_node = index->nodes[index->entry_point];
-                if (entry_node && entry_node->connection_count[0] < (index->M * 2)) {
-                    entry_node->connections[0][entry_node->connection_count[0]] = node_id;
-                    entry_node->connection_count[0]++;
-                }
-            }
+    // Connect to the graph using production-grade algorithm
+    err = hnsw_connect_layers_safe(index, node_id, node->level);
+    if (err != CVECTOR_SUCCESS) {
+        // Cleanup on failure
+        for (uint32_t level = 0; level <= node->level; level++) {
+            free(node->connections[level]);
         }
-    } else {
-        // Use full connection logic for later nodes
-        cvector_error_t err = hnsw_connect_layers(index, node_id, node->level);
-        if (err != CVECTOR_SUCCESS) {
-            // Cleanup on failure
-            for (uint32_t level = 0; level <= node->level; level++) {
-                free(node->connections[level]);
-            }
-            free(node->vector_data);
-            free(node);
-            index->node_count--;
-            index->nodes[node_id] = NULL;
-            return err;
-        }
+        free(node->vector_data);
+        free(node);
+        index->node_count--;
+        index->nodes[node_id] = NULL;
+        return err;
     }
     
     // Update entry point if this node is at a higher level
@@ -430,19 +484,57 @@ cvector_error_t hnsw_add_vector(hnsw_index_t* index, cvector_id_t id, const floa
     return CVECTOR_SUCCESS;
 }
 
-static cvector_error_t hnsw_connect_layers(hnsw_index_t* index, uint32_t node_id, uint32_t node_level) {
+static cvector_error_t hnsw_connect_layers_safe(hnsw_index_t* index, uint32_t node_id, uint32_t max_level) {
+    if (!index || node_id >= index->node_count || !index->nodes[node_id]) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // For the first few nodes, use simple connections to avoid complex graph issues
+    if (index->node_count <= 5) {
+        hnsw_node_t* node = index->nodes[node_id];
+        
+        // Connect to all existing nodes at appropriate levels
+        for (uint32_t i = 0; i < node_id; i++) {
+            if (!index->nodes[i]) continue;
+            
+            hnsw_node_t* neighbor = index->nodes[i];
+            uint32_t common_level = (node->level < neighbor->level) ? node->level : neighbor->level;
+            
+            // Add bidirectional connections at all common levels
+            for (uint32_t level = 0; level <= common_level; level++) {
+                uint32_t max_conn = (level == 0) ? index->M * 2 : index->M;
+                
+                // Add connection from node to neighbor
+                if (node->connection_count[level] < max_conn) {
+                    node->connections[level][node->connection_count[level]] = i;
+                    node->connection_count[level]++;
+                }
+                
+                // Add connection from neighbor to node
+                if (neighbor->connection_count[level] < max_conn) {
+                    neighbor->connections[level][neighbor->connection_count[level]] = node_id;
+                    neighbor->connection_count[level]++;
+                }
+            }
+        }
+        return CVECTOR_SUCCESS;
+    }
+    
+    // For larger graphs, use proper HNSW algorithm
     hnsw_priority_queue_t* entry_points;
-    cvector_error_t err = hnsw_pq_create(1, false, &entry_points);
+    cvector_error_t err = hnsw_pq_create(index->ef_construction, false, &entry_points);
     if (err != CVECTOR_SUCCESS) return err;
     
     // Start from entry point
-    float entry_dist = hnsw_calculate_similarity(index->nodes[node_id]->vector_data,
-                                                index->nodes[index->entry_point]->vector_data,
-                                                index->dimension, index->similarity_type);
-    hnsw_pq_push(entry_points, index->entry_point, entry_dist);
+    if (index->entry_point != UINT32_MAX && index->nodes[index->entry_point]) {
+        float entry_dist = hnsw_calculate_similarity(index->nodes[node_id]->vector_data,
+                                                    index->nodes[index->entry_point]->vector_data,
+                                                    index->dimension, index->similarity_type);
+        hnsw_pq_push(entry_points, index->entry_point, entry_dist);
+    }
     
-    // Search from top level down to node_level + 1
-    for (uint32_t level = index->max_level; level > node_level; level--) {
+    // Search from top level down to max_level + 1
+    for (uint32_t level = index->max_level; level > max_level; level--) {
         err = hnsw_search_layer(index, index->nodes[node_id]->vector_data, entry_points, 1, level);
         if (err != CVECTOR_SUCCESS) {
             hnsw_pq_destroy(entry_points);
@@ -450,8 +542,8 @@ static cvector_error_t hnsw_connect_layers(hnsw_index_t* index, uint32_t node_id
         }
     }
     
-    // Search and connect at each level from node_level down to 0
-    for (uint32_t level = node_level; level != UINT32_MAX; level--) {
+    // Search and connect at each level from max_level down to 0
+    for (uint32_t level = max_level; level != UINT32_MAX; level--) {
         uint32_t ef = (level == 0) ? index->ef_construction : index->M;
         
         err = hnsw_search_layer(index, index->nodes[node_id]->vector_data, entry_points, ef, level);
@@ -460,32 +552,80 @@ static cvector_error_t hnsw_connect_layers(hnsw_index_t* index, uint32_t node_id
             return err;
         }
         
-        // Select M neighbors and create bidirectional connections
-        uint32_t max_connections = (level == 0) ? index->M * 2 : index->M;
-        uint32_t connections_to_add = (entry_points->count < max_connections) ? 
-                                     entry_points->count : max_connections;
-        
-        hnsw_node_t* node = index->nodes[node_id];
-        
-        // Add connections from new node to neighbors
-        for (uint32_t i = 0; i < connections_to_add && i < entry_points->count; i++) {
-            uint32_t neighbor_id = entry_points->items[i].node_id;
-            if (neighbor_id != node_id && node->connection_count[level] < max_connections) {
-                node->connections[level][node->connection_count[level]] = neighbor_id;
-                node->connection_count[level]++;
-                
-                // Add reverse connection
-                hnsw_node_t* neighbor = index->nodes[neighbor_id];
-                if (neighbor->connection_count[level] < max_connections) {
-                    neighbor->connections[level][neighbor->connection_count[level]] = node_id;
-                    neighbor->connection_count[level]++;
-                }
-            }
+        // Use sophisticated neighbor selection
+        err = hnsw_select_neighbors_simple(index, node_id, entry_points, index->M, level);
+        if (err != CVECTOR_SUCCESS) {
+            hnsw_pq_destroy(entry_points);
+            return err;
         }
     }
     
     hnsw_pq_destroy(entry_points);
     return CVECTOR_SUCCESS;
+}
+
+static cvector_error_t hnsw_select_neighbors_simple(hnsw_index_t* index, uint32_t node_id, 
+                                                   hnsw_priority_queue_t* candidates, uint32_t M, uint32_t level) {
+    if (!index || !candidates || node_id >= index->node_count || !index->nodes[node_id]) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    hnsw_node_t* node = index->nodes[node_id];
+    uint32_t max_connections = (level == 0) ? M * 2 : M;
+    
+    // Simple selection: take the M closest candidates
+    uint32_t selected = 0;
+    while (!hnsw_pq_is_empty(candidates) && selected < M && node->connection_count[level] < max_connections) {
+        uint32_t neighbor_id;
+        float distance;
+        if (!hnsw_pq_pop(candidates, &neighbor_id, &distance)) break;
+        
+        // Skip self-connections
+        if (neighbor_id == node_id) continue;
+        
+        // Verify neighbor exists and is valid
+        if (neighbor_id >= index->node_count || !index->nodes[neighbor_id]) continue;
+        
+        // Check if connection already exists
+        bool already_connected = false;
+        for (uint32_t i = 0; i < node->connection_count[level]; i++) {
+            if (node->connections[level][i] == neighbor_id) {
+                already_connected = true;
+                break;
+            }
+        }
+        if (already_connected) continue;
+        
+        // Add connection from node to neighbor
+        node->connections[level][node->connection_count[level]] = neighbor_id;
+        node->connection_count[level]++;
+        
+        // Add reverse connection from neighbor to node
+        hnsw_node_t* neighbor = index->nodes[neighbor_id];
+        if (neighbor->connection_count[level] < max_connections) {
+            // Check if reverse connection already exists
+            bool reverse_exists = false;
+            for (uint32_t i = 0; i < neighbor->connection_count[level]; i++) {
+                if (neighbor->connections[level][i] == node_id) {
+                    reverse_exists = true;
+                    break;
+                }
+            }
+            if (!reverse_exists) {
+                neighbor->connections[level][neighbor->connection_count[level]] = node_id;
+                neighbor->connection_count[level]++;
+            }
+        }
+        
+        selected++;
+    }
+    
+    return CVECTOR_SUCCESS;
+}
+
+static cvector_error_t hnsw_connect_layers(hnsw_index_t* index, uint32_t node_id, uint32_t node_level) {
+    // Legacy function - redirect to safe implementation
+    return hnsw_connect_layers_safe(index, node_id, node_level);
 }
 
 cvector_error_t hnsw_search(hnsw_index_t* index, const float* query_vector, 
@@ -495,21 +635,47 @@ cvector_error_t hnsw_search(hnsw_index_t* index, const float* query_vector,
 
 cvector_error_t hnsw_search_with_ef(hnsw_index_t* index, const float* query_vector,
                                    uint32_t top_k, uint32_t ef, hnsw_search_result_t** result) {
-    if (!index || !query_vector || !result || top_k == 0) {
+    // Input validation with detailed logging
+    cvector_error_t err = hnsw_validate_index(index);
+    if (err != CVECTOR_SUCCESS) return err;
+    
+    if (!query_vector) {
+        hnsw_log(HNSW_LOG_ERROR, "Query vector is NULL");
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
+    if (!result) {
+        hnsw_log(HNSW_LOG_ERROR, "Result pointer is NULL");
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (top_k == 0) {
+        hnsw_log(HNSW_LOG_ERROR, "top_k must be greater than 0");
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (ef == 0) {
+        hnsw_log(HNSW_LOG_WARN, "ef is 0, using default value %d", index->ef_search);
+        ef = index->ef_search;
+    }
+    
+    hnsw_log(HNSW_LOG_DEBUG, "Searching HNSW index: top_k=%u, ef=%u, nodes=%u", 
+             top_k, ef, index->node_count);
+    
     if (index->node_count == 0 || index->entry_point == UINT32_MAX) {
-        // Empty index
+        hnsw_log(HNSW_LOG_INFO, "Empty index, returning empty results");
         *result = calloc(1, sizeof(hnsw_search_result_t));
-        if (!*result) return CVECTOR_ERROR_OUT_OF_MEMORY;
+        if (!*result) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to allocate empty result structure");
+            return CVECTOR_ERROR_OUT_OF_MEMORY;
+        }
         return CVECTOR_SUCCESS;
     }
     
     index->search_count++;
     
     hnsw_priority_queue_t* entry_points;
-    cvector_error_t err = hnsw_pq_create(ef, false, &entry_points);
+    err = hnsw_pq_create(ef, false, &entry_points);
     if (err != CVECTOR_SUCCESS) return err;
     
     // Start from entry point
@@ -558,16 +724,51 @@ cvector_error_t hnsw_search_with_ef(hnsw_index_t* index, const float* query_vect
             return CVECTOR_ERROR_OUT_OF_MEMORY;
         }
         
-        // Copy results (priority queue is min-heap, so we get closest first)
+        // Copy results to temporary array for sorting
+        typedef struct {
+            cvector_id_t id;
+            float similarity;
+        } result_item_t;
+        
+        result_item_t* temp_results = malloc(result_count * sizeof(result_item_t));
+        if (!temp_results) {
+            free((*result)->ids);
+            free((*result)->similarities);
+            free(*result);
+            *result = NULL;
+            hnsw_pq_destroy(entry_points);
+            return CVECTOR_ERROR_OUT_OF_MEMORY;
+        }
+        
+        // Extract results from priority queue
         for (uint32_t i = 0; i < result_count; i++) {
             uint32_t node_id;
             float distance;
             if (hnsw_pq_pop(entry_points, &node_id, &distance)) {
-                (*result)->ids[i] = index->nodes[node_id]->id;
-                (*result)->similarities[i] = distance;
+                temp_results[i].id = index->nodes[node_id]->id;
+                temp_results[i].similarity = distance;
                 index->total_distance_computations++;
             }
         }
+        
+        // Sort results by similarity (descending - higher similarity first)
+        for (uint32_t i = 0; i < result_count - 1; i++) {
+            for (uint32_t j = i + 1; j < result_count; j++) {
+                if (temp_results[j].similarity > temp_results[i].similarity) {
+                    result_item_t temp = temp_results[i];
+                    temp_results[i] = temp_results[j];
+                    temp_results[j] = temp;
+                }
+            }
+        }
+        
+        // Copy sorted results to final structure
+        for (uint32_t i = 0; i < result_count; i++) {
+            (*result)->ids[i] = temp_results[i].id;
+            (*result)->similarities[i] = temp_results[i].similarity;
+        }
+        
+        free(temp_results);
     } else {
         (*result)->ids = NULL;
         (*result)->similarities = NULL;
@@ -641,24 +842,275 @@ cvector_error_t hnsw_get_config(hnsw_index_t* index, hnsw_config_t* config) {
     return CVECTOR_SUCCESS;
 }
 
-// Placeholder implementations for persistence
+// Production-grade HNSW persistence implementation
 cvector_error_t hnsw_save_index(hnsw_index_t* index, const char* filepath) {
-    if (!index || !filepath) {
+    cvector_error_t err = hnsw_validate_index(index);
+    if (err != CVECTOR_SUCCESS) return err;
+    
+    if (!filepath) {
+        hnsw_log(HNSW_LOG_ERROR, "Filepath is NULL");
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
-    // TODO: Implement binary serialization of the HNSW index
-    // This would save the index structure, nodes, connections, and metadata
-    return CVECTOR_ERROR_INVALID_ARGS; // Not implemented yet
+    hnsw_log(HNSW_LOG_INFO, "Saving HNSW index to %s", filepath);
+    
+    FILE* file = fopen(filepath, "wb");
+    if (!file) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to open file %s for writing", filepath);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Write header with magic number and version
+    uint32_t magic = 0x484E5357; // "HNSW"
+    uint32_t version = 1;
+    if (fwrite(&magic, sizeof(magic), 1, file) != 1 ||
+        fwrite(&version, sizeof(version), 1, file) != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to write header");
+        fclose(file);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Write index metadata
+    if (fwrite(&index->dimension, sizeof(index->dimension), 1, file) != 1 ||
+        fwrite(&index->similarity_type, sizeof(index->similarity_type), 1, file) != 1 ||
+        fwrite(&index->M, sizeof(index->M), 1, file) != 1 ||
+        fwrite(&index->ef_construction, sizeof(index->ef_construction), 1, file) != 1 ||
+        fwrite(&index->ef_search, sizeof(index->ef_search), 1, file) != 1 ||
+        fwrite(&index->ml, sizeof(index->ml), 1, file) != 1 ||
+        fwrite(&index->node_count, sizeof(index->node_count), 1, file) != 1 ||
+        fwrite(&index->entry_point, sizeof(index->entry_point), 1, file) != 1 ||
+        fwrite(&index->max_level, sizeof(index->max_level), 1, file) != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to write index metadata");
+        fclose(file);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Write nodes
+    for (uint32_t i = 0; i < index->node_count; i++) {
+        if (!index->nodes[i]) {
+            hnsw_log(HNSW_LOG_ERROR, "Node %u is NULL during save", i);
+            fclose(file);
+            return CVECTOR_ERROR_DB_CORRUPT;
+        }
+        
+        hnsw_node_t* node = index->nodes[i];
+        
+        // Write node metadata
+        if (fwrite(&node->id, sizeof(node->id), 1, file) != 1 ||
+            fwrite(&node->level, sizeof(node->level), 1, file) != 1 ||
+            fwrite(&node->dimension, sizeof(node->dimension), 1, file) != 1) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to write node %u metadata", i);
+            fclose(file);
+            return CVECTOR_ERROR_FILE_IO;
+        }
+        
+        // Write vector data
+        if (fwrite(node->vector_data, sizeof(float), node->dimension, file) != node->dimension) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to write node %u vector data", i);
+            fclose(file);
+            return CVECTOR_ERROR_FILE_IO;
+        }
+        
+        // Write connections for each level
+        for (uint32_t level = 0; level <= node->level; level++) {
+            if (fwrite(&node->connection_count[level], sizeof(node->connection_count[level]), 1, file) != 1) {
+                hnsw_log(HNSW_LOG_ERROR, "Failed to write node %u level %u connection count", i, level);
+                fclose(file);
+                return CVECTOR_ERROR_FILE_IO;
+            }
+            
+            if (node->connection_count[level] > 0) {
+                if (fwrite(node->connections[level], sizeof(uint32_t), 
+                          node->connection_count[level], file) != node->connection_count[level]) {
+                    hnsw_log(HNSW_LOG_ERROR, "Failed to write node %u level %u connections", i, level);
+                    fclose(file);
+                    return CVECTOR_ERROR_FILE_IO;
+                }
+            }
+        }
+    }
+    
+    fclose(file);
+    hnsw_log(HNSW_LOG_INFO, "Successfully saved HNSW index with %u nodes", index->node_count);
+    return CVECTOR_SUCCESS;
 }
 
 cvector_error_t hnsw_load_index(const char* filepath, hnsw_index_t** index) {
     if (!filepath || !index) {
+        hnsw_log(HNSW_LOG_ERROR, "Invalid arguments to hnsw_load_index");
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
-    // TODO: Implement binary deserialization of the HNSW index
-    return CVECTOR_ERROR_INVALID_ARGS; // Not implemented yet
+    hnsw_log(HNSW_LOG_INFO, "Loading HNSW index from %s", filepath);
+    
+    FILE* file = fopen(filepath, "rb");
+    if (!file) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to open file %s for reading", filepath);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Read and verify header
+    uint32_t magic, version;
+    if (fread(&magic, sizeof(magic), 1, file) != 1 ||
+        fread(&version, sizeof(version), 1, file) != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to read header");
+        fclose(file);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    if (magic != 0x484E5357) {
+        hnsw_log(HNSW_LOG_ERROR, "Invalid magic number: expected 0x484E5357, got 0x%08X", magic);
+        fclose(file);
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    
+    if (version != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Unsupported version: %u", version);
+        fclose(file);
+        return CVECTOR_ERROR_DB_CORRUPT;
+    }
+    
+    // Read index metadata
+    uint32_t dimension;
+    cvector_similarity_t similarity_type;
+    if (fread(&dimension, sizeof(dimension), 1, file) != 1 ||
+        fread(&similarity_type, sizeof(similarity_type), 1, file) != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to read index basic metadata");
+        fclose(file);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Create index
+    cvector_error_t err = hnsw_create_index(dimension, similarity_type, index);
+    if (err != CVECTOR_SUCCESS) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to create index during load");
+        fclose(file);
+        return err;
+    }
+    
+    hnsw_index_t* idx = *index;
+    
+    // Read remaining metadata
+    if (fread(&idx->M, sizeof(idx->M), 1, file) != 1 ||
+        fread(&idx->ef_construction, sizeof(idx->ef_construction), 1, file) != 1 ||
+        fread(&idx->ef_search, sizeof(idx->ef_search), 1, file) != 1 ||
+        fread(&idx->ml, sizeof(idx->ml), 1, file) != 1 ||
+        fread(&idx->node_count, sizeof(idx->node_count), 1, file) != 1 ||
+        fread(&idx->entry_point, sizeof(idx->entry_point), 1, file) != 1 ||
+        fread(&idx->max_level, sizeof(idx->max_level), 1, file) != 1) {
+        hnsw_log(HNSW_LOG_ERROR, "Failed to read index configuration");
+        hnsw_destroy_index(idx);
+        *index = NULL;
+        fclose(file);
+        return CVECTOR_ERROR_FILE_IO;
+    }
+    
+    // Ensure capacity is sufficient
+    while (idx->node_capacity < idx->node_count) {
+        err = hnsw_resize_index(idx);
+        if (err != CVECTOR_SUCCESS) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to resize index during load");
+            hnsw_destroy_index(idx);
+            *index = NULL;
+            fclose(file);
+            return err;
+        }
+    }
+    
+    // Read nodes
+    for (uint32_t i = 0; i < idx->node_count; i++) {
+        hnsw_node_t* node = calloc(1, sizeof(hnsw_node_t));
+        if (!node) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to allocate node %u", i);
+            hnsw_destroy_index(idx);
+            *index = NULL;
+            fclose(file);
+            return CVECTOR_ERROR_OUT_OF_MEMORY;
+        }
+        
+        // Read node metadata
+        if (fread(&node->id, sizeof(node->id), 1, file) != 1 ||
+            fread(&node->level, sizeof(node->level), 1, file) != 1 ||
+            fread(&node->dimension, sizeof(node->dimension), 1, file) != 1) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to read node %u metadata", i);
+            free(node);
+            hnsw_destroy_index(idx);
+            *index = NULL;
+            fclose(file);
+            return CVECTOR_ERROR_FILE_IO;
+        }
+        
+        // Allocate and read vector data
+        node->vector_data = malloc(node->dimension * sizeof(float));
+        if (!node->vector_data) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to allocate vector data for node %u", i);
+            free(node);
+            hnsw_destroy_index(idx);
+            *index = NULL;
+            fclose(file);
+            return CVECTOR_ERROR_OUT_OF_MEMORY;
+        }
+        
+        if (fread(node->vector_data, sizeof(float), node->dimension, file) != node->dimension) {
+            hnsw_log(HNSW_LOG_ERROR, "Failed to read node %u vector data", i);
+            free(node->vector_data);
+            free(node);
+            hnsw_destroy_index(idx);
+            *index = NULL;
+            fclose(file);
+            return CVECTOR_ERROR_FILE_IO;
+        }
+        
+        // Read connections for each level
+        for (uint32_t level = 0; level <= node->level; level++) {
+            if (fread(&node->connection_count[level], sizeof(node->connection_count[level]), 1, file) != 1) {
+                hnsw_log(HNSW_LOG_ERROR, "Failed to read node %u level %u connection count", i, level);
+                free(node->vector_data);
+                free(node);
+                hnsw_destroy_index(idx);
+                *index = NULL;
+                fclose(file);
+                return CVECTOR_ERROR_FILE_IO;
+            }
+            
+            if (node->connection_count[level] > 0) {
+                uint32_t max_connections = (level == 0) ? idx->M * 2 : idx->M;
+                node->connections[level] = malloc(max_connections * sizeof(uint32_t));
+                if (!node->connections[level]) {
+                    hnsw_log(HNSW_LOG_ERROR, "Failed to allocate connections for node %u level %u", i, level);
+                    for (uint32_t l = 0; l < level; l++) {
+                        free(node->connections[l]);
+                    }
+                    free(node->vector_data);
+                    free(node);
+                    hnsw_destroy_index(idx);
+                    *index = NULL;
+                    fclose(file);
+                    return CVECTOR_ERROR_OUT_OF_MEMORY;
+                }
+                
+                if (fread(node->connections[level], sizeof(uint32_t), 
+                         node->connection_count[level], file) != node->connection_count[level]) {
+                    hnsw_log(HNSW_LOG_ERROR, "Failed to read node %u level %u connections", i, level);
+                    for (uint32_t l = 0; l <= level; l++) {
+                        free(node->connections[l]);
+                    }
+                    free(node->vector_data);
+                    free(node);
+                    hnsw_destroy_index(idx);
+                    *index = NULL;
+                    fclose(file);
+                    return CVECTOR_ERROR_FILE_IO;
+                }
+            }
+        }
+        
+        idx->nodes[i] = node;
+    }
+    
+    fclose(file);
+    hnsw_log(HNSW_LOG_INFO, "Successfully loaded HNSW index with %u nodes", idx->node_count);
+    return CVECTOR_SUCCESS;
 }
 
 cvector_error_t hnsw_remove_vector(hnsw_index_t* index, cvector_id_t id) {

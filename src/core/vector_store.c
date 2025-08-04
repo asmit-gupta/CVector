@@ -9,6 +9,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // Internal database structure
 struct cvector_db {
@@ -18,6 +19,8 @@ struct cvector_db {
     FILE* metadata_file;
     cvector_id_t next_id;
     size_t vector_count;
+    pthread_mutex_t mutex;          // Thread safety mutex
+    pthread_rwlock_t search_lock;   // Read-write lock for searches
     bool is_open;
     
     // Simple hash table for vector lookup (in-memory for now)
@@ -174,6 +177,17 @@ cvector_error_t cvector_db_create(const cvector_db_config_t* config, cvector_db_
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
+    // Validate data path
+    if (!config->data_path || strlen(config->data_path) == 0) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Validate similarity type
+    if (config->default_similarity < CVECTOR_SIMILARITY_COSINE || 
+        config->default_similarity > CVECTOR_SIMILARITY_EUCLIDEAN) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
     // Check if database already exists
     struct stat st;
     if (stat(config->data_path, &st) == 0) {
@@ -201,6 +215,20 @@ cvector_error_t cvector_db_create(const cvector_db_config_t* config, cvector_db_
     memcpy(&database->config, config, sizeof(cvector_db_config_t));
     database->next_id = 1;
     database->vector_count = 0;
+    
+    // Initialize thread safety mechanisms
+    if (pthread_mutex_init(&database->mutex, NULL) != 0) {
+        free(database);
+        *db = NULL;
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
+    
+    if (pthread_rwlock_init(&database->search_lock, NULL) != 0) {
+        pthread_mutex_destroy(&database->mutex);
+        free(database);
+        *db = NULL;
+        return CVECTOR_ERROR_OUT_OF_MEMORY;
+    }
     
     // Initialize hash table
     cvector_error_t err = cvector_init_hash_table(database);
@@ -320,7 +348,14 @@ cvector_error_t cvector_db_open(const char* db_path, cvector_db_t** db) {
                     // Add to hash table
                     cvector_hash_insert(database, record.id, record_start, record.dimension);
                     
-                    // HNSW indexing temporarily disabled for stability
+                    // Rebuild HNSW index - add vector back to HNSW
+                    if (database->hnsw_index) {
+                        cvector_error_t hnsw_err = hnsw_add_vector(database->hnsw_index, record.id, vector_data);
+                        if (hnsw_err != CVECTOR_SUCCESS) {
+                            printf("Warning: Failed to rebuild HNSW vector %llu: %s\n", 
+                                   (unsigned long long)record.id, cvector_error_string(hnsw_err));
+                        }
+                    }
                 }
                 free(vector_data);
             }
@@ -357,6 +392,10 @@ cvector_error_t cvector_db_close(cvector_db_t* db) {
         db->hnsw_index = NULL;
     }
     
+    // Cleanup thread safety mechanisms
+    pthread_mutex_destroy(&db->mutex);
+    pthread_rwlock_destroy(&db->search_lock);
+    
     db->is_open = false;
     free(db);
     
@@ -384,8 +423,12 @@ cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
         return CVECTOR_ERROR_DIMENSION_MISMATCH;
     }
     
+    // Thread safety: acquire write lock
+    pthread_mutex_lock(&db->mutex);
+    
     // Check if vector with this ID already exists
     if (cvector_hash_find(db, vector->id)) {
+        pthread_mutex_unlock(&db->mutex);
         return CVECTOR_ERROR_INVALID_ARGS;  // Vector already exists
     }
     
@@ -418,7 +461,16 @@ cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
         return err;
     }
     
-    // HNSW indexing temporarily disabled for stability
+    // Add to HNSW index
+    if (db->hnsw_index) {
+        err = hnsw_add_vector(db->hnsw_index, vector->id, vector->data);
+        if (err != CVECTOR_SUCCESS) {
+            // Note: In production, we might want to rollback the hash table entry
+            // For now, we'll log the error but continue
+            printf("Warning: Failed to add vector %llu to HNSW index: %s\n", 
+                   vector->id, cvector_error_string(err));
+        }
+    }
     
     // Update counters
     db->vector_count++;
@@ -427,11 +479,28 @@ cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
     }
     
     fflush(db->data_file);
+    
+    // Thread safety: release write lock
+    pthread_mutex_unlock(&db->mutex);
+    
     return CVECTOR_SUCCESS;
 }
 
 cvector_error_t cvector_get(cvector_db_t* db, cvector_id_t id, cvector_t** vector) {
-    if (!db || !db->is_open || !vector) {
+    // Comprehensive input validation
+    if (!db) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (!db->is_open) {
+        return CVECTOR_ERROR_DB_NOT_FOUND;
+    }
+    
+    if (!vector) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (id == 0) {  // ID 0 is typically invalid
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
@@ -484,31 +553,55 @@ cvector_error_t cvector_get(cvector_db_t* db, cvector_id_t id, cvector_t** vecto
 }
 
 cvector_error_t cvector_delete(cvector_db_t* db, cvector_id_t id) {
-    if (!db || !db->is_open) {
+    // Comprehensive input validation
+    if (!db) {
         return CVECTOR_ERROR_INVALID_ARGS;
     }
+    
+    if (!db->is_open) {
+        return CVECTOR_ERROR_DB_NOT_FOUND;
+    }
+    
+    if (id == 0) {  // ID 0 is typically invalid
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Thread safety: acquire write lock
+    pthread_mutex_lock(&db->mutex);
     
     // Find in hash table
     cvector_vector_entry_t* entry = cvector_hash_find(db, id);
     if (!entry) {
+        pthread_mutex_unlock(&db->mutex);
         return CVECTOR_ERROR_VECTOR_NOT_FOUND;
     }
     
     // Mark as deleted in hash table
     entry->is_deleted = true;
     
-    // HNSW indexing temporarily disabled for stability
+    // Remove from HNSW index
+    if (db->hnsw_index) {
+        cvector_error_t hnsw_err = hnsw_remove_vector(db->hnsw_index, id);
+        if (hnsw_err != CVECTOR_SUCCESS) {
+            printf("Warning: Failed to remove vector %llu from HNSW index: %s\n", 
+                   id, cvector_error_string(hnsw_err));
+        }
+    }
     
     // Mark as deleted in file
     fseek(db->data_file, entry->file_offset + offsetof(cvector_vector_record_t, is_deleted), SEEK_SET);
     uint8_t deleted_flag = 1;
     size_t written = fwrite(&deleted_flag, sizeof(deleted_flag), 1, db->data_file);
     if (written != 1) {
+        pthread_mutex_unlock(&db->mutex);
         return CVECTOR_ERROR_FILE_IO;
     }
     
     db->vector_count--;
     fflush(db->data_file);
+    
+    // Thread safety: release write lock
+    pthread_mutex_unlock(&db->mutex);
     
     return CVECTOR_SUCCESS;
 }
@@ -523,6 +616,18 @@ cvector_error_t cvector_search(cvector_db_t* db, const cvector_query_t* query,
         return CVECTOR_ERROR_INVALID_ARGS;
     }
     
+    // Validate query parameters
+    if (query->top_k == 0 || query->top_k > 10000) {  // Reasonable limit
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    if (query->min_similarity < -1.0f || query->min_similarity > 1.0f) {
+        return CVECTOR_ERROR_INVALID_ARGS;
+    }
+    
+    // Thread safety: acquire read lock for search operations
+    pthread_rwlock_rdlock(&db->search_lock);
+    
     *results = NULL;
     *result_count = 0;
     
@@ -531,10 +636,55 @@ cvector_error_t cvector_search(cvector_db_t* db, const cvector_query_t* query,
         return CVECTOR_SUCCESS;
     }
     
-    // Use brute force search - HNSW temporarily disabled for stability
+    // Try HNSW search first, fall back to brute force if needed
+    if (db->hnsw_index && db->vector_count > 0) {
+        hnsw_search_result_t* hnsw_result = NULL;
+        cvector_error_t hnsw_err = hnsw_search_with_ef(db->hnsw_index, query->query_vector, 
+                                                       query->top_k, query->top_k * 2, &hnsw_result);
+        
+        if (hnsw_err == CVECTOR_SUCCESS && hnsw_result && hnsw_result->count > 0) {
+            // Convert HNSW results to our format
+            *results = malloc(hnsw_result->count * sizeof(cvector_result_t));
+            if (*results) {
+                *result_count = 0;
+                for (uint32_t i = 0; i < hnsw_result->count && *result_count < query->top_k; i++) {
+                    float similarity = hnsw_result->similarities[i];
+                    
+                    // Apply similarity threshold
+                    if (query->min_similarity == 0.0f || similarity >= query->min_similarity) {
+                        (*results)[*result_count].id = hnsw_result->ids[i];
+                        (*results)[*result_count].similarity = similarity;
+                        (*results)[*result_count].vector = NULL;
+                        (*result_count)++;
+                    }
+                }
+                
+                // Resize results array if needed
+                if (*result_count < hnsw_result->count) {
+                    cvector_result_t* resized = realloc(*results, *result_count * sizeof(cvector_result_t));
+                    if (resized) {
+                        *results = resized;
+                    }
+                }
+                
+                hnsw_free_search_result(hnsw_result);
+                return CVECTOR_SUCCESS;
+            }
+        }
+        
+        if (hnsw_result) {
+            hnsw_free_search_result(hnsw_result);
+        }
+        
+        // If HNSW failed, fall back to brute force
+        printf("HNSW search failed, falling back to brute force\n");
+    }
+    
+    // Brute force search fallback
     size_t max_results = (query->top_k < db->vector_count) ? query->top_k : db->vector_count;
     cvector_result_t* temp_results = malloc(max_results * sizeof(cvector_result_t));
     if (!temp_results) {
+        pthread_rwlock_unlock(&db->search_lock);
         return CVECTOR_ERROR_OUT_OF_MEMORY;
     }
     
@@ -601,6 +751,7 @@ cvector_error_t cvector_search(cvector_db_t* db, const cvector_query_t* query,
     
     if (valid_results == 0) {
         free(temp_results);
+        pthread_rwlock_unlock(&db->search_lock);
         return CVECTOR_SUCCESS;
     }
     
@@ -614,6 +765,10 @@ cvector_error_t cvector_search(cvector_db_t* db, const cvector_query_t* query,
     
     *results = temp_results;
     *result_count = valid_results;
+    
+    // Thread safety: release read lock
+    pthread_rwlock_unlock(&db->search_lock);
+    
     return CVECTOR_SUCCESS;
 }
 
