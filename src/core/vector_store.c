@@ -111,12 +111,20 @@ static cvector_vector_entry_t* cvector_hash_find(cvector_db_t* db, cvector_id_t 
     uint64_t hash_idx = cvector_hash(id);
     cvector_vector_entry_t* entry = db->hash_table[hash_idx];
     
-    while (entry) {
+    int max_iterations = 1000; // Prevent infinite loops
+    while (entry && max_iterations-- > 0) {
         if (entry->id == id && !entry->is_deleted) {
             return entry;
         }
         entry = entry->next;
     }
+    
+    if (max_iterations <= 0) {
+        // Corrupted hash table - log error but don't crash
+        fprintf(stderr, "ERROR: Hash table corruption detected for ID %llu\n", 
+                (unsigned long long)id);
+    }
+    
     return NULL;
 }
 
@@ -446,18 +454,21 @@ cvector_error_t cvector_insert(cvector_db_t* db, const cvector_t* vector) {
     // Write record header
     size_t written = fwrite(&record, sizeof(record), 1, db->data_file);
     if (written != 1) {
+        pthread_mutex_unlock(&db->mutex);
         return CVECTOR_ERROR_FILE_IO;
     }
     
     // Write vector data
     written = fwrite(vector->data, sizeof(float), vector->dimension, db->data_file);
     if (written != vector->dimension) {
+        pthread_mutex_unlock(&db->mutex);
         return CVECTOR_ERROR_FILE_IO;
     }
     
     // Add to hash table
     cvector_error_t err = cvector_hash_insert(db, vector->id, file_offset, vector->dimension);
     if (err != CVECTOR_SUCCESS) {
+        pthread_mutex_unlock(&db->mutex);
         return err;
     }
     
